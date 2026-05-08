@@ -1,0 +1,120 @@
+name: Agent-Notify
+
+on:
+  push:
+    paths:
+      - '**/AUFTRAG_*.md'
+      - '**/ERGEBNIS_*.md'
+      - '**/REVIEW_*.md'
+      - '**/FINAL_*.md'
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect agent files
+        id: detect
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep -E '(AUFTRAG|ERGEBNIS|REVIEW|FINAL)_.*\.md$' || true)
+          if [ -z "$CHANGED" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "skip=false" >> $GITHUB_OUTPUT
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Determine type from first matching file
+          FIRST=$(echo "$CHANGED" | head -1)
+          BASENAME=$(basename "$FIRST")
+          TYPE=$(echo "$BASENAME" | grep -oP '^(AUFTRAG|ERGEBNIS|REVIEW|FINAL)')
+          echo "type=$TYPE" >> $GITHUB_OUTPUT
+          echo "filename=$BASENAME" >> $GITHUB_OUTPUT
+
+      - name: Create issue for AUFTRAG
+        if: steps.detect.outputs.skip == 'false' && steps.detect.outputs.type == 'AUFTRAG'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const files = `${{ steps.detect.outputs.files }}`.trim().split('\n');
+            const content = fs.readFileSync(files[0], 'utf8');
+            const title = content.split('\n').find(l => l.startsWith('# '))?.replace('# ', '') || files[0];
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[MANUS-JOB] ${title}`,
+              body: `Neuer Auftrag eingegangen.\n\n**Datei:** ${files[0]}\n**Commit:** ${context.sha}\n\n---\n\n${content.substring(0, 3000)}`,
+              labels: ['manus-job']
+            });
+
+      - name: Close issue for ERGEBNIS
+        if: steps.detect.outputs.skip == 'false' && steps.detect.outputs.type == 'ERGEBNIS'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const filename = '${{ steps.detect.outputs.filename }}';
+            const jobName = filename.replace('ERGEBNIS_', '').replace('.md', '');
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'manus-job',
+              state: 'open'
+            });
+
+            for (const issue of issues) {
+              if (issue.title.toLowerCase().includes(jobName.toLowerCase())) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                  labels: ['manus-done']
+                });
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: `Ergebnis eingegangen: \`${filename}\`\nCommit: ${context.sha}`
+                });
+                break;
+              }
+            }
+
+      - name: Reopen issue for REVIEW
+        if: steps.detect.outputs.skip == 'false' && steps.detect.outputs.type == 'REVIEW'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'manus-done',
+              state: 'closed',
+              per_page: 5
+            });
+
+            if (issues.length > 0) {
+              const issue = issues[0];
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'open',
+                labels: ['manus-review']
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Review-Feedback eingegangen: \`${{ steps.detect.outputs.filename }}\`\nCommit: ${context.sha}`
+              });
+            }
